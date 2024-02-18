@@ -479,10 +479,14 @@
 
    %listFolderItems(driveId=&driveId., folderId=&folderId., out=__tmpLst);
 
-   proc sql noprint;
-      select _microsoft_graph_downloadUrl into: dlUrl TRIMMED from folderItems
-         where name="&sourceFilename";
-   quit;
+  /* Use DATA step functions here to escape & to avoid warnings for unresolved symbols */
+  data _null_;
+    set __tmpLst;
+    length resURL $ 2000;
+    where name="&sourceFilename";
+    resURL = tranwrd(_microsoft_graph_downloadUrl,'&','%str(&)');
+    call symputx('dlURL',resURL);
+  run;
 
    proc delete data=work.__tmpLst; run;
 
@@ -511,6 +515,137 @@
    options &_opt;
 %mend downloadFile;
 
+/* 
+Split a file into same-size chunks, often needed for HTTP uploads
+of large files via an API
+
+Sample use:
+   %splitFile(sourceFile=c:\temp\register-hypno.gif, 
+      maxSize=327680,
+      metadataOut=work.chunkMeta,
+      chunkLoc=c:\temp\chunks);
+   */
+
+%macro splitFile(sourceFile=,
+   maxSize=327680,
+   metadataOut=,
+   /* optional, will default to WORK */
+   chunkLoc=);
+
+   %local filesize maxSize numChunks buffsize ;
+   %let buffsize = %sysfunc(min(&maxSize,4096));
+   %let filesize = %getFileSize(localFile=&sourceFile.);
+   %let numChunks = %sysfunc(ceil(%sysevalf( &filesize / &maxSize. )));
+   %put NOTE: Splitting &sourceFile. into &numChunks parts;
+
+   %if %isBlank(&chunkLoc.) %then %do;
+      %let chunkLoc = %sysfunc(getoption(WORK));
+   %end;
+
+   /* This DATA step will do the chunking.                                 */
+   /* It's going to read the original file in segments sized to the buffer */
+   /* It's going to write that content to new files up to the max size     */
+   /* of a "chunk", then it will move on to a new file in the sequence     */
+   /* All resulting files should be the size we specified for chunks       */
+   /* except for the last one, which will be a remnant                     */
+   /* Along the way it will build a data set with the metadata for these   */
+   /* chunked files, including the file location and byte range info       */
+   /* that will be useful for APIs that need that later on                 */
+   data &metadataOut.(keep=original originalsize chunkpath chunksize byterange);
+      length 
+         filein 8 fileid 8 chunkno 8 currsize 8 buffIn 8 rec $ &buffsize fmtLength 8 outfmt $ 12
+         bytescumulative 8
+         /* These are the fields we'll store in output data set */
+         original $ 250 originalsize 8 chunkpath $ 500 chunksize 8 byterange $ 50;
+      original = "&sourceFile";
+      originalsize = &filesize.;
+      rc = filename('in',"&sourceFile.");
+      filein = fopen('in','S',&buffsize.,'B');
+      bytescumulative = 0;
+      do chunkno = 1 to &numChunks.;
+         currsize = 0;
+         chunkpath = catt("&chunkLoc./chunk_",put(chunkno,z4.),".dat");
+         rc = filename('out',chunkpath);
+         fileid = fopen('out','O',&buffsize.,'B');
+         do while ( fread(filein)=0 ) ;
+         call missing(outfmt, rec);
+         rc = fget(filein,rec, &buffsize.);
+         buffIn = fcol(filein);
+         if (buffIn - &buffsize) = 1 then do;
+            currsize + &buffsize;
+            fmtLength = &buffsize.;
+         end;
+         else do;
+            currsize + (buffIn-1);
+            fmtLength = (buffIn-1);
+         end;
+         /* write only the bytes we read, no padding */
+         outfmt = cats("$char", fmtLength, ".");
+         rcPut = fput(fileid, putc(rec, outfmt));
+         rcWrite = fwrite(fileid);      
+         if (currsize >= &maxSize.) then leave;
+         end;
+         chunksize = currsize;
+         bytescumulative + chunksize;
+         byterange = cat("bytes ",bytescumulative-chunksize,"-",bytescumulative-1,"/",originalsize);
+         output;
+         rc = fclose(fileid);
+      end;
+      rc = fclose(filein);
+   run;
+%mend splitFile;
+
+/* Upload a single file segment as part of an upload session */
+%macro uploadFileChunk(
+   uploadURL=,
+   chunkFile=,
+   byteRange=
+   );
+
+   filename hdrout temp;
+   filename resp temp;
+
+   filename _tosave "&chunkFile.";
+   proc http url= "&uploadURL"
+      method="PUT"
+      in=_tosave
+      out=resp
+      oauth_bearer="&access_token"
+      headerout=hdrout
+      ;
+      headers
+         "Content-Range"="&byteRange."
+         ;
+      run;
+
+   %put NOTE: Upload segment &byteRange., HTTP result - &SYS_PROCHTTP_STATUS_CODE. &SYS_PROCHTTP_STATUS_PHRASE.; 
+
+   /* HTTP 200 if success, 201 if new file was created */
+   %if (%sysfunc(substr(&SYS_PROCHTTP_STATUS_CODE.,1,1)) ne 2) %then
+      %do;
+         %put WARNING: File upload failed!;
+         %if (%sysfunc(fexist(resp))) %then
+         %do;
+            data _null_;
+               rc=jsonpp('resp','log');
+            run;
+         %end;
+
+         %if (%sysfunc(fexist(hdrout))) %then
+         %do;
+            data _null_;
+               infile hdrout;
+               input;
+               put _infile_;
+            run;
+         %end;
+      %end;
+
+   filename _tosave clear;
+   filename hdrout clear;
+   filename resp clear;
+
+%mend uploadFileChunk;
 
 /*
    Use an UploadSession in the Microsoft Graph API to upload a file.
@@ -519,11 +654,18 @@
    PUT to the :/content endpoint.
    The Graph API doc says you need to split the file into chunks, but
    using EXPECT_100_CONTINUE in PROC HTTP seems to do the trick.
+   This can handle large files, greater than the 4MB limit used by     
+   PUT to the :/content endpoint.                                       
+   The Graph API doc says you need to split the file into chunks.       
 
    We do need to know the total file size in bytes before using the API, so
    this code includes a file-size check.
 
-   Credit to Muzzammil Nakhuda at SAS for figuring this out.
+   It also uses a splitFile macro to create a collection of file segments
+   for upload. These must be in multiples of 320K size according to the doc
+   (except for the last segment, which is a remainder size).
+   
+   Credit to Muzzammil Nakhuda at SAS for figuring this out.           
 
    Usage:
       %uploadFile(driveId=&driveId.,folderId=&folder.,
@@ -531,98 +673,56 @@
          sourceFilename=<local-SAS-file-name>);
 */
 %macro uploadFile(driveId=,folderId=,sourcePath=,sourceFilename=) ;
-   %local driveId folderId fileSize _opt uploadURL;
-   %let _opt = %sysfunc(getoption(quotelenmax));
-   options noquotelenmax;
-   filename resp temp;
-
+  %local driveId folderId fileSize _opt uploadURL;
+  %let _opt = %sysfunc(getoption(quotelenmax)); 
+  options noquotelenmax;
+  filename resp_us temp;
+ 
    /* Create an upload session to upload the file.                                                */
    /* If a file of the same name exists, we will REPLACE it.                                      */
    /* The API doc says this should be POST, but since we provide a body with conflict directives, */
    /* it seems we must use PUT.                                                                   */
    proc http url="&msgraphApiBase./me/drives/&driveId./items/&folderId.:/%sysfunc(urlencode(&sourceFilename.)):/createUploadSession"
-      method="PUT"
-      in='{ "item": {"@microsoft.graph.conflictBehavior": "replace" } }'
-      out=resp
-      ct="application/json"
-      oauth_bearer="&access_token";
+     method="PUT"
+     in='{ "item": {"@microsoft.graph.conflictBehavior": "replace" } }'
+     out=resp_us
+     ct="application/json"
+     oauth_bearer="&access_token";
    run;
    %put NOTE: Create Upload Session: HTTP result - &SYS_PROCHTTP_STATUS_CODE. &SYS_PROCHTTP_STATUS_PHRASE.;
 
-   %if (&SYS_PROCHTTP_STATUS_CODE. = 200) %then %do;
-      libname resp JSON fileref=resp;
+    %if (&SYS_PROCHTTP_STATUS_CODE. = 200) %then %do;
+      libname resp_us JSON fileref=resp_us;   
       data _null_;
-      set resp.root;
-         call symputx('uploadURL',uploadUrl);
+      set resp_us.root; 
+       call symputx('uploadURL',uploadUrl);
       run;
+         
+      %let fileSize=%getFileSize(localfile=&sourcePath./&sourceFilename.);  
+   
+      %put NOTE: Uploading &sourcePath./&sourceFilename., file size of &fileSize bytes.;
 
-      filename _tosave "&sourcePath./&sourceFilename.";
+      /* split the file into segments for upload */
+      %splitFile(
+       sourceFile=&sourcePath./&sourceFilename.,
+       maxSize = 1310720, /* 327680 * 4, must be multiples of 320K per doc */
+       metadataOut=work._fileSegments
+       );
 
-      %let fileSize=%getFileSize(localfile=&sourcePath./&sourceFilename.);
-      %let end_index=%eval(&fileSize.-1);
-
-      %put Uploading &sourcePath./&sourceFilename., file size of &fileSize bytes.;
-
-      filename hdrout temp;
-      filename resp temp;
-
-      proc http url= "%superq(uploadURL)"
-         method="PUT"
-         in=_tosave
-         out=resp
-         oauth_bearer="&access_token"
-         headerout=hdrout
-         EXPECT_100_CONTINUE
-         ;
-         headers
-            "Content-Range"="bytes 0-&end_index/&fileSize."
-            ;
+      /* upload each segment file in this upload session */
+      data _null_;
+        set work._fileSegments;
+        call execute(catt('%nrstr(%uploadFileChunk(uploadURL = %superq(uploadURL),chunkFile=',chunkPath,',byteRange=',byteRange,'));'));
       run;
-
-      %put NOTE: Upload file HTTP result - &SYS_PROCHTTP_STATUS_CODE. &SYS_PROCHTTP_STATUS_PHRASE.;
-      /* HTTP 200 if success, 201 if new file was created */
-      %if (%sysfunc(substr(&SYS_PROCHTTP_STATUS_CODE.,1,1))=2) %then %do;
-         /*
-            Successful call returns a json response that describes the item uploaded.
-            This step pulls out the main file attributes from that response.
-         */
-         libname attrs json fileref=resp;
-         %if %sysfunc(exist(attrs.root)) %then %do;
-            data _null_;
-               length filename $ 100 createdDate 8 modifiedDate 8 filesize 8;
-               set attrs.root;
-               filename = name;
-               modifiedDate = input(lastModifiedDateTime,anydtdtm.);
-               createdDate  = input(createdDateTime,anydtdtm.);
-               format createdDate datetime20. modifiedDate datetime20.;
-               filesize = size;
-               msg = cat(name,' uploaded. File size: ',put(size,comma15. -L),' bytes. Created '
-                        ,put(createdDate,datetime20.), ', Modified ',put(modifiedDate,datetime20.));
-               put 'NOTE: ' msg;
-            run;
-         %end;
-         libname attrs clear;
+      proc delete data=work._fileSegments;
+    %end;
+     /* Failed to create Upload Session */
+     %else %do;
+      %put WARNING: Upload session not created!; 
+      %if (%sysfunc(fexist(resp_us))) %then %do;
+        data _null_; rc=jsonpp('resp_us','log'); run;
       %end;
-      %else %do;
-         %put WARNING: File upload failed!;
-         %if (%sysfunc(fexist(resp))) %then %do;
-            data _null_; rc=jsonpp('resp','log'); run;
-         %end;
-         %if (%sysfunc(fexist(hdrout))) %then %do;
-            data _null_; infile hdrout; input; put _infile_; run;
-         %end;
-      %end;
-      filename _tosave clear;
-      filename hdrout clear;
-   %end;
-   %else %do;
-      %put WARNING: Upload session not created!;
-      %if (%sysfunc(fexist(resp))) %then %do;
-         data _null_; rc=jsonpp('resp','log'); run;
-      %end;
-   %end;
-   filename resp clear;
-   options &_opt;
-%mend uploadFile;
-
-
+     %end;
+     filename resp_us clear;
+     options &_opt;
+ %mend;
